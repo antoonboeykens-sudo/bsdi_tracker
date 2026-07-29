@@ -26,7 +26,8 @@ import urllib.error
 import anthropic
 
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "2"))  # how far back to search each run
+_lookback_raw = os.environ.get("LOOKBACK_DAYS", "").strip()
+LOOKBACK_DAYS = int(_lookback_raw) if _lookback_raw else 9  # default covers weekly runs with a couple days' overlap
 MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "members.json")
 
 SYSTEM_PROMPT = """You are a research assistant that finds recent, real news about a specific \
