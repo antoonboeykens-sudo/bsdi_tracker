@@ -233,6 +233,8 @@ def upsert_supabase(rows: list, supabase_url: str, supabase_key: str):
 def main():
     anthropic_key = os.environ["ANTHROPIC_API_KEY"].strip()
     supabase_url = os.environ["SUPABASE_URL"].strip().rstrip("/")
+    if supabase_url.endswith("/rest/v1"):
+        supabase_url = supabase_url[: -len("/rest/v1")]
     supabase_key = os.environ["SUPABASE_KEY"].strip()
 
     client = anthropic.Anthropic(api_key=anthropic_key)
