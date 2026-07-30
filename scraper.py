@@ -95,6 +95,15 @@ def load_members(supabase_url: str, supabase_key: str) -> list:
                 print(f"Loaded {len(names)} active members from Supabase.")
                 return names
             print("[warn] Supabase members table returned 0 active rows; falling back to members.json")
+    except urllib.error.HTTPError as e:
+        # Print (masked) diagnostics without ever printing the key itself
+        masked_url = endpoint.split("?")[0]
+        print(f"[warn] could not load members from Supabase: HTTP {e.code} at {masked_url}", file=sys.stderr)
+        print(f"[warn] response body: {e.read().decode()[:300]}", file=sys.stderr)
+        print(f"[warn] SUPABASE_URL length={len(supabase_url)}, SUPABASE_KEY length={len(supabase_key)} "
+              f"(sanity check — should be ~40-50 chars and ~200+ chars respectively, with no stray whitespace)",
+              file=sys.stderr)
+        print("[warn] falling back to members.json", file=sys.stderr)
     except Exception as e:
         print(f"[warn] could not load members from Supabase ({e}); falling back to members.json", file=sys.stderr)
 
@@ -111,7 +120,6 @@ def extract_json(client: anthropic.Anthropic, research_notes: str) -> list:
             system=EXTRACTION_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": f"Researcher's notes:\n\n{research_notes}"},
-                {"role": "assistant", "content": "{"},  # prefill forces JSON-only output
             ],
         )
     except Exception as e:
@@ -119,7 +127,13 @@ def extract_json(client: anthropic.Anthropic, research_notes: str) -> list:
         return []
 
     text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    full_text = "{" + "\n".join(text_parts).strip()  # re-add the prefilled brace
+    full_text = "\n".join(text_parts).strip()
+
+    # Strip stray code fences if the model added them despite instructions
+    if full_text.startswith("```"):
+        full_text = full_text.strip("`")
+        if full_text.lower().startswith("json"):
+            full_text = full_text[4:]
 
     try:
         data = json.loads(full_text)
@@ -217,9 +231,9 @@ def upsert_supabase(rows: list, supabase_url: str, supabase_key: str):
 
 
 def main():
-    anthropic_key = os.environ["ANTHROPIC_API_KEY"]
-    supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
-    supabase_key = os.environ["SUPABASE_KEY"]
+    anthropic_key = os.environ["ANTHROPIC_API_KEY"].strip()
+    supabase_url = os.environ["SUPABASE_URL"].strip().rstrip("/")
+    supabase_key = os.environ["SUPABASE_KEY"].strip()
 
     client = anthropic.Anthropic(api_key=anthropic_key)
     members = load_members(supabase_url, supabase_key)
