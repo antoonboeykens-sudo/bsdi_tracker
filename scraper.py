@@ -30,17 +30,29 @@ _lookback_raw = os.environ.get("LOOKBACK_DAYS", "").strip()
 LOOKBACK_DAYS = int(_lookback_raw) if _lookback_raw else 9  # default covers weekly runs with a couple days' overlap
 MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "members.json")
 
-SYSTEM_PROMPT = """You are a research assistant that finds recent, real news about a specific \
+RESEARCH_SYSTEM_PROMPT = """You are a research assistant that finds recent, real news about a specific \
 defence/security company signing agreements with international partners \
 (Memoranda of Understanding, Letters of Intent, contracts, or partnership announcements).
 
 Only report items that are:
 - Genuinely about the named company (not a similarly named unrelated company)
 - Dated within the requested lookback window
-- Backed by a real, checkable news source (return the exact source URL)
+- Backed by a real, checkable news source (note the exact source URL for each)
 
-If you find nothing, return an empty items list. Do not invent or guess details.
-Respond ONLY with valid JSON, no markdown fences, no commentary, matching this schema:
+If you find nothing relevant, say so plainly. Do not invent or guess details.
+You may explain your search process and reasoning freely in this response — a
+second step will structure your findings, so plain prose is fine here.
+"""
+
+EXTRACTION_SYSTEM_PROMPT = """You convert research notes into strict JSON. You will be given a \
+researcher's findings about a company's international agreements. Extract every \
+concrete, sourced item into this exact schema. If the notes contain no concrete \
+sourced items (e.g. they say nothing was found, or only mention unconfirmed/vague \
+leads without a source URL), return an empty items list.
+
+Respond ONLY with valid JSON, no markdown fences, no commentary, no explanation \
+before or after — your entire response must be parseable by json.loads(). Match \
+this schema exactly:
 
 {
   "items": [
@@ -60,13 +72,78 @@ Respond ONLY with valid JSON, no markdown fences, no commentary, matching this s
 """
 
 
-def load_members():
+def load_members(supabase_url: str, supabase_key: str) -> list:
+    """Fetch the active member list from Supabase (source of truth).
+
+    Falls back to the local members.json only if the Supabase call fails,
+    so a transient network issue doesn't stop the whole run.
+    """
+    endpoint = f"{supabase_url}/rest/v1/members?select=name&active=eq.true&order=name.asc"
+    req = urllib.request.Request(
+        endpoint,
+        method="GET",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            rows = json.loads(resp.read().decode())
+            names = [r["name"] for r in rows]
+            if names:
+                print(f"Loaded {len(names)} active members from Supabase.")
+                return names
+            print("[warn] Supabase members table returned 0 active rows; falling back to members.json")
+    except Exception as e:
+        print(f"[warn] could not load members from Supabase ({e}); falling back to members.json", file=sys.stderr)
+
     with open(MEMBERS_FILE) as f:
         return json.load(f)
 
 
-def search_member(client: anthropic.Anthropic, member: str, since: str) -> list:
-    """Query Claude with web search for one member; return list of item dicts."""
+def extract_json(client: anthropic.Anthropic, research_notes: str) -> list:
+    """Second-pass call: convert free-form research notes into strict JSON."""
+    try:
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=1500,
+            system=EXTRACTION_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": f"Researcher's notes:\n\n{research_notes}"},
+                {"role": "assistant", "content": "{"},  # prefill forces JSON-only output
+            ],
+        )
+    except Exception as e:
+        print(f"  [error] extraction call failed: {e}", file=sys.stderr)
+        return []
+
+    text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+    full_text = "{" + "\n".join(text_parts).strip()  # re-add the prefilled brace
+
+    try:
+        data = json.loads(full_text)
+        return data.get("items", [])
+    except json.JSONDecodeError:
+        # Fallback: try to salvage a JSON object from within the text
+        start = full_text.find("{")
+        end = full_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                data = json.loads(full_text[start:end + 1])
+                return data.get("items", [])
+            except json.JSONDecodeError:
+                pass
+        print(f"  [warn] could not parse extraction JSON: {full_text[:200]}", file=sys.stderr)
+        return []
+
+
+def search_member(client: anthropic.Anthropic, member: str, since: str, max_retries: int = 3) -> list:
+    """Research a member's news with web search, then extract structured items in a second call.
+
+    Retries the research call on transient errors (e.g. 529 overloaded, rate
+    limits) with exponential backoff before giving up on this member for this run.
+    """
     user_prompt = (
         f"Company: \"{member}\"\n"
         f"Search for news published since {since} about this company signing an MoU, "
@@ -74,37 +151,46 @@ def search_member(client: anthropic.Anthropic, member: str, since: str) -> list:
         f"partner (another company, government, or institution outside Belgium, or a "
         f"significant cross-border deal). Belgian domestic-only news without an "
         f"international partner does not count.\n"
-        f"Return the JSON object described in your instructions."
+        f"Describe what you find, including source URLs, dates, and partner names."
     )
 
-    try:
-        response = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        )
-    except Exception as e:
-        print(f"  [error] API call failed for {member}: {e}", file=sys.stderr)
+    response = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=2000,
+                system=RESEARCH_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            )
+            break  # success
+        except anthropic.APIStatusError as e:
+            # Transient server-side issues (529 overloaded, 500s) are worth retrying.
+            # Client errors like 400/401/403 won't fix themselves on retry.
+            transient = e.status_code in (429, 500, 502, 503, 529)
+            if transient and attempt < max_retries:
+                wait = 2 ** attempt  # 2s, 4s, 8s...
+                print(f"  [retry {attempt}/{max_retries}] {member}: {e}. Waiting {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            print(f"  [error] API call failed for {member} after {attempt} attempt(s): {e}", file=sys.stderr)
+            return []
+        except Exception as e:
+            print(f"  [error] API call failed for {member}: {e}", file=sys.stderr)
+            return []
+
+    if response is None:
         return []
 
     # Concatenate all text blocks (web search results interleave tool_use/tool_result blocks)
     text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    full_text = "\n".join(text_parts).strip()
+    research_notes = "\n".join(text_parts).strip()
 
-    # Strip stray code fences if the model added them despite instructions
-    if full_text.startswith("```"):
-        full_text = full_text.strip("`")
-        if full_text.lower().startswith("json"):
-            full_text = full_text[4:]
-
-    try:
-        data = json.loads(full_text)
-        return data.get("items", [])
-    except json.JSONDecodeError:
-        print(f"  [warn] could not parse JSON for {member}: {full_text[:200]}", file=sys.stderr)
+    if not research_notes:
         return []
+
+    return extract_json(client, research_notes)
 
 
 def upsert_supabase(rows: list, supabase_url: str, supabase_key: str):
@@ -132,11 +218,11 @@ def upsert_supabase(rows: list, supabase_url: str, supabase_key: str):
 
 def main():
     anthropic_key = os.environ["ANTHROPIC_API_KEY"]
-    supabase_url = os.environ["SUPABASE_URL"]
+    supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
     supabase_key = os.environ["SUPABASE_KEY"]
 
     client = anthropic.Anthropic(api_key=anthropic_key)
-    members = load_members()
+    members = load_members(supabase_url, supabase_key)
     since = (datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
 
     total_found = 0
