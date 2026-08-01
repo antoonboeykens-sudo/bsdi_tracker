@@ -27,7 +27,9 @@ import anthropic
 
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 _lookback_raw = os.environ.get("LOOKBACK_DAYS", "").strip()
-LOOKBACK_DAYS = int(_lookback_raw) if _lookback_raw else 9  # default covers weekly runs with a couple days' overlap
+FORCE_LOOKBACK_DAYS = int(_lookback_raw) if _lookback_raw else None  # manual override for ALL members, ignores tracking
+BACKFILL_START_DATE = os.environ.get("BACKFILL_START_DATE", "2026-01-01").strip()  # used for members never scraped before
+CATCHUP_OVERLAP_DAYS = 3  # small overlap when resuming from last_scraped_until, in case a story was published right at the edge
 MEMBERS_FILE = os.path.join(os.path.dirname(__file__), "members.json")
 
 RESEARCH_SYSTEM_PROMPT = """You are a research assistant that finds recent, real news about a specific \
@@ -73,12 +75,13 @@ this schema exactly:
 
 
 def load_members(supabase_url: str, supabase_key: str) -> list:
-    """Fetch the active member list from Supabase (source of truth).
+    """Fetch active members (name + last_scraped_until) from Supabase.
 
-    Falls back to the local members.json only if the Supabase call fails,
-    so a transient network issue doesn't stop the whole run.
+    Returns a list of dicts: {"name": ..., "last_scraped_until": "YYYY-MM-DD" or None}
+    Falls back to the local members.json (treated as never-scraped) only if
+    the Supabase call fails, so a transient network issue doesn't stop the run.
     """
-    endpoint = f"{supabase_url}/rest/v1/members?select=name&active=eq.true&order=name.asc"
+    endpoint = f"{supabase_url}/rest/v1/members?select=name,last_scraped_until&active=eq.true&order=name.asc"
     req = urllib.request.Request(
         endpoint,
         method="GET",
@@ -90,10 +93,9 @@ def load_members(supabase_url: str, supabase_key: str) -> list:
     try:
         with urllib.request.urlopen(req) as resp:
             rows = json.loads(resp.read().decode())
-            names = [r["name"] for r in rows]
-            if names:
-                print(f"Loaded {len(names)} active members from Supabase.")
-                return names
+            if rows:
+                print(f"Loaded {len(rows)} active members from Supabase.")
+                return [{"name": r["name"], "last_scraped_until": r.get("last_scraped_until")} for r in rows]
             print("[warn] Supabase members table returned 0 active rows; falling back to members.json")
     except urllib.error.HTTPError as e:
         # Print (masked) diagnostics without ever printing the key itself
@@ -108,7 +110,30 @@ def load_members(supabase_url: str, supabase_key: str) -> list:
         print(f"[warn] could not load members from Supabase ({e}); falling back to members.json", file=sys.stderr)
 
     with open(MEMBERS_FILE) as f:
-        return json.load(f)
+        names = json.load(f)
+    return [{"name": n, "last_scraped_until": None} for n in names]
+
+
+def update_last_scraped(member: str, until_date: str, supabase_url: str, supabase_key: str):
+    """PATCH the member's last_scraped_until so the next run resumes from here."""
+    import urllib.parse
+    endpoint = f"{supabase_url}/rest/v1/members?name=eq.{urllib.parse.quote(member)}"
+    body = json.dumps({"last_scraped_until": until_date}).encode()
+    req = urllib.request.Request(
+        endpoint,
+        data=body,
+        method="PATCH",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+    )
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        print(f"  [error] could not update last_scraped_until for {member}: {e.read().decode()}", file=sys.stderr)
 
 
 def extract_json(client: anthropic.Anthropic, research_notes: str) -> list:
@@ -239,15 +264,31 @@ def main():
 
     client = anthropic.Anthropic(api_key=anthropic_key)
     members = load_members(supabase_url, supabase_key)
-    since = (datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
+    today = datetime.date.today()
+    today_iso = today.isoformat()
 
     total_found = 0
-    errors = []
+    new_members_backfilled = 0
 
-    print(f"Starting scrape for {len(members)} members, since {since}")
+    print(f"Starting scrape for {len(members)} members (today: {today_iso})")
+    if FORCE_LOOKBACK_DAYS is not None:
+        print(f"Manual override active: searching all members since {FORCE_LOOKBACK_DAYS} days ago, ignoring tracking.")
 
-    for i, member in enumerate(members, 1):
-        print(f"[{i}/{len(members)}] {member}")
+    for i, m in enumerate(members, 1):
+        member = m["name"]
+        last_until = m.get("last_scraped_until")
+
+        if FORCE_LOOKBACK_DAYS is not None:
+            since = (today - datetime.timedelta(days=FORCE_LOOKBACK_DAYS)).isoformat()
+        elif last_until:
+            since = (datetime.date.fromisoformat(last_until) - datetime.timedelta(days=CATCHUP_OVERLAP_DAYS)).isoformat()
+        else:
+            since = BACKFILL_START_DATE
+            new_members_backfilled += 1
+
+        tag = "[NEW - backfilling]" if not last_until and FORCE_LOOKBACK_DAYS is None else ""
+        print(f"[{i}/{len(members)}] {member} (since {since}) {tag}")
+
         items = search_member(client, member, since)
 
         rows = []
@@ -270,10 +311,15 @@ def main():
             total_found += len(rows)
             print(f"  -> found {len(rows)} item(s)")
 
-        # gentle pacing to avoid rate limits across ~170 members
+        # Record progress so next run resumes from today, regardless of whether
+        # this was a manual override run — we've now checked up to today either way.
+        update_last_scraped(member, today_iso, supabase_url, supabase_key)
+
+        # gentle pacing to avoid rate limits across many members
         time.sleep(1)
 
-    print(f"Done. {total_found} new item(s) found across {len(members)} members.")
+    print(f"Done. {total_found} new item(s) found across {len(members)} members "
+          f"({new_members_backfilled} newly backfilled from {BACKFILL_START_DATE}).")
 
 
 if __name__ == "__main__":
