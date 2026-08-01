@@ -6,7 +6,7 @@ on:
   workflow_dispatch:        # allows manual trigger from the Actions tab, with an optional wide backfill
     inputs:
       lookback_days:
-        description: "How many days back to search (leave blank for default weekly window)"
+        description: "Override: force-search ALL members back N days, ignoring per-member tracking (leave blank for normal incremental run)"
         required: false
         default: ""
 
@@ -29,4 +29,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days }}
-        run: python scraper.py
+        run: python -u scraper.py
