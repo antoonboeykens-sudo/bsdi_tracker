@@ -137,44 +137,54 @@ def update_last_scraped(member: str, until_date: str, supabase_url: str, supabas
 
 
 def extract_json(client: anthropic.Anthropic, research_notes: str) -> list:
-    """Second-pass call: convert free-form research notes into strict JSON."""
-    try:
-        response = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=1500,
-            system=EXTRACTION_SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": f"Researcher's notes:\n\n{research_notes}"},
-            ],
-        )
-    except Exception as e:
-        print(f"  [error] extraction call failed: {e}", file=sys.stderr)
-        return []
+    """Second-pass call: convert free-form research notes into strict JSON.
 
-    text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    full_text = "\n".join(text_parts).strip()
+    If the response gets cut off (hits the token limit) before finishing,
+    retries once with a larger limit rather than trying to parse broken JSON.
+    """
+    for max_tokens in (4000, 8000):
+        try:
+            response = client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=max_tokens,
+                system=EXTRACTION_SYSTEM_PROMPT,
+                messages=[
+                    {"role": "user", "content": f"Researcher's notes:\n\n{research_notes}"},
+                ],
+            )
+        except Exception as e:
+            print(f"  [error] extraction call failed: {e}", file=sys.stderr)
+            return []
 
-    # Strip stray code fences if the model added them despite instructions
-    if full_text.startswith("```"):
-        full_text = full_text.strip("`")
-        if full_text.lower().startswith("json"):
-            full_text = full_text[4:]
+        if response.stop_reason == "max_tokens":
+            print(f"  [warn] extraction response truncated at max_tokens={max_tokens}, retrying with more room...", file=sys.stderr)
+            continue
 
-    try:
-        data = json.loads(full_text)
-        return data.get("items", [])
-    except json.JSONDecodeError:
-        # Fallback: try to salvage a JSON object from within the text
-        start = full_text.find("{")
-        end = full_text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                data = json.loads(full_text[start:end + 1])
-                return data.get("items", [])
-            except json.JSONDecodeError:
-                pass
-        print(f"  [warn] could not parse extraction JSON: {full_text[:200]}", file=sys.stderr)
-        return []
+        text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+        full_text = "\n".join(text_parts).strip()
+
+        if full_text.startswith("```"):
+            full_text = full_text.strip("`")
+            if full_text.lower().startswith("json"):
+                full_text = full_text[4:]
+
+        try:
+            data = json.loads(full_text)
+            return data.get("items", [])
+        except json.JSONDecodeError:
+            start = full_text.find("{")
+            end = full_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    data = json.loads(full_text[start:end + 1])
+                    return data.get("items", [])
+                except json.JSONDecodeError:
+                    pass
+            print(f"  [warn] could not parse extraction JSON: {full_text[:200]}", file=sys.stderr)
+            return []
+
+    print("  [error] extraction still truncated after retry with larger limit; giving up for this member", file=sys.stderr)
+    return []
 
 
 def search_member(client: anthropic.Anthropic, member: str, since: str, max_retries: int = 3) -> list:
@@ -198,7 +208,7 @@ def search_member(client: anthropic.Anthropic, member: str, since: str, max_retr
         try:
             response = client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=2000,
+                max_tokens=3500,
                 system=RESEARCH_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_prompt}],
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
@@ -233,10 +243,16 @@ def search_member(client: anthropic.Anthropic, member: str, since: str, max_retr
 
 
 def upsert_supabase(rows: list, supabase_url: str, supabase_key: str):
-    """POST rows to Supabase REST API with upsert (on conflict do nothing on the unique index)."""
+    """POST rows to Supabase REST API, skipping duplicates on (member_name, partner_name, source_url).
+
+    on_conflict must name the exact columns behind the unique index, or
+    PostgREST doesn't know what counts as a duplicate and the whole batch
+    insert fails if any single row collides -- silently losing every other
+    valid row in that same batch.
+    """
     if not rows:
         return
-    endpoint = f"{supabase_url}/rest/v1/announcements"
+    endpoint = f"{supabase_url}/rest/v1/announcements?on_conflict=member_name,partner_name,source_url"
     body = json.dumps(rows).encode()
     req = urllib.request.Request(
         endpoint,
@@ -292,7 +308,15 @@ def main():
         items = search_member(client, member, since)
 
         rows = []
+        skipped_out_of_range = 0
         for item in items:
+            event_date = item.get("event_date")
+            # Hard safety filter: the model is instructed to only report items
+            # since `since`, but that's a soft instruction, not a real search
+            # filter. Enforce it here rather than trusting compliance blindly.
+            if event_date and event_date < since:
+                skipped_out_of_range += 1
+                continue
             rows.append({
                 "member_name": member,
                 "partner_name": item.get("partner_name", "Unknown"),
@@ -300,11 +324,14 @@ def main():
                 "agreement_type": item.get("agreement_type", "Other"),
                 "title": item.get("title", ""),
                 "summary": item.get("summary", ""),
-                "event_date": item.get("event_date"),
+                "event_date": event_date,
                 "source_url": item.get("source_url", ""),
                 "source_name": item.get("source_name"),
                 "confidence": item.get("confidence", "medium"),
             })
+
+        if skipped_out_of_range:
+            print(f"  [filtered] dropped {skipped_out_of_range} item(s) dated before {since}")
 
         if rows:
             upsert_supabase(rows, supabase_url, supabase_key)
